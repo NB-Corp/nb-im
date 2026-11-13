@@ -1,0 +1,142 @@
+name: Release candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Semver version represented by the checked-out vN.N.N tag
+        required: true
+        default: '0.3.1'
+        type: string
+      publish:
+        description: Publish the verified candidate to npm using the configured OIDC trusted publisher
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-v${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify release candidate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the requested tag
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@7088e561eb65bb68695d245aa206f005ef30921d # v4.1.0
+        with:
+          version: 10.33.0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24.15.0
+          cache: pnpm
+
+      - name: Verify tag, commit, and package version
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if ! node -e "if (!/^(0|[1-9][0-9]*)[.](0|[1-9][0-9]*)[.](0|[1-9][0-9]*)$/.test(process.env.VERSION)) process.exit(1)"; then
+            echo 'version must be a plain x.y.z semver for a v-prefixed release tag' >&2
+            exit 1
+          fi
+          test "$GITHUB_REF" = "refs/tags/v$VERSION"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse "refs/tags/v${VERSION}^{commit}")" = "$GITHUB_SHA"
+          PACKAGE_VERSION="$(node -e "process.stdout.write(JSON.parse(require('node:fs').readFileSync('package.json','utf8')).version)")"
+          test "$PACKAGE_VERSION" = "$VERSION"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile --ignore-scripts
+
+      - name: Build and verify
+        run: pnpm run build && pnpm run typecheck && pnpm test
+
+      - name: Pack candidate tarball
+        id: candidate
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/candidate"
+          TARBALL_NAME="$(npm pack --pack-destination "$RUNNER_TEMP/candidate" | tail -n 1)"
+          TARBALL="$RUNNER_TEMP/candidate/$TARBALL_NAME"
+          test -f "$TARBALL"
+          node - "$TARBALL" "$RUNNER_TEMP/candidate/manifest.json" <<'NODE'
+          const { createHash } = require('node:crypto');
+          const { readFileSync, writeFileSync } = require('node:fs');
+          const [tarballPath, manifestPath] = process.argv.slice(2);
+          const sha256 = createHash('sha256').update(readFileSync(tarballPath)).digest('hex');
+          writeFileSync(manifestPath, JSON.stringify({ version: process.env.VERSION, sha256 }, null, 2));
+          NODE
+          {
+            echo "tarball=$TARBALL"
+            echo "manifest=$RUNNER_TEMP/candidate/manifest.json"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upload verified candidate artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: nb-im-release-candidate
+          path: |
+            ${{ steps.candidate.outputs.tarball }}
+            ${{ steps.candidate.outputs.manifest }}
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publish explicitly approved candidate
+    if: ${{ inputs.publish == true }}
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    environment:
+      name: npmpublish
+    steps:
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24.15.0
+
+      - name: Download verified candidate
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: nb-im-release-candidate
+          path: candidate
+
+      - name: Publish to npm through OIDC trusted publishing
+        env:
+          VERSION: ${{ inputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TARBALL="$(find candidate -type f -name '*.tgz' -print -quit)"
+          MANIFEST="$(find candidate -type f -name 'manifest.json' -print -quit)"
+          test -n "$TARBALL"
+          test -n "$MANIFEST"
+          node - "$MANIFEST" "$TARBALL" <<'NODE'
+          const { createHash } = require('node:crypto');
+          const { readFileSync } = require('node:fs');
+          const [manifestPath, tarballPath] = process.argv.slice(2);
+          const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+          const digest = createHash('sha256').update(readFileSync(tarballPath)).digest('hex');
+          if (manifest.sha256 !== digest || manifest.version !== process.env.VERSION) process.exit(1);
+          NODE
+          npm publish "$TARBALL" --registry=https://registry.npmjs.org/ --access public --tag latest --provenance
+          echo "Published @nb-corp/nb-im@$VERSION through the configured trusted publisher."

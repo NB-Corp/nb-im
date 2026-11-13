@@ -1,0 +1,56 @@
+{
+  "name": "@nb-corp/nb-im",
+  "version": "0.3.1",
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org"
+  },
+  "description": "Bidirectional messaging sessions and durable notification outbox for Node.js >=24.15",
+  "license": "MIT",
+  "homepage": "https://github.com/NB-Corp/nb-im#readme",
+  "bugs": {
+    "url": "https://github.com/NB-Corp/nb-im/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/NB-Corp/nb-im.git"
+  },
+  "type": "module",
+  "packageManager": "pnpm@10.33.0",
+  "engines": {
+    "node": ">=24.15.0"
+  },
+  "files": [
+    "dist",
+    "src",
+    "LICENSE",
+    "NOTICE",
+    "LICENSES",
+    "README.md"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "1.76.0",
+    "@slack/socket-mode": "3.1.0",
+    "@slack/web-api": "8.2.0",
+    "discord.js": "14.27.0",
+    "matrix-js-sdk": "44.0.0",
+    "undici": "7.29.1",
+    "ws": "8.22.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.3",
+    "typescript": "5.9.3"
+  },
+  "scripts": {
+    "test": "node --test --experimental-strip-types test/*.test.ts",
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "check": "pnpm run test && pnpm run build"
+  }
+}

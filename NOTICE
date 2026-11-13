@@ -1,0 +1,23 @@
+@nb-corp/nb-im uses the following pinned SDKs. License texts for the direct dependencies and adapted donors are included under LICENSES; transitive dependency licenses remain with their installed packages.
+
+0.3.0 bidirectional adapter batch:
+- discord.js@14.27.0 (Apache-2.0) — gateway lifecycle and Discord REST/multipart implementation.
+- @slack/web-api@8.2.0 and @slack/socket-mode@3.1.0 (MIT) — official Slack API, Socket Mode and external file-upload sequence.
+- matrix-js-sdk@44.0.0 (Apache-2.0) — Matrix authenticated HTTP contracts. No crypto store is initialized; encrypted rooms are not supported by this adapter.
+- undici@7.29.1 (MIT) — explicit supported peer for Slack Socket Mode.
+
+Identity/thread/media/setup field mappings adapt OpenClaw (MIT, Copyright 2026 OpenClaw Foundation), and Hermes Agent (MIT, Copyright 2025 Nous Research):
+- OpenClaw local checkout 3c9b8602b79b2ae2f3c9a76ac7dfb9579ea8eefc: extensions/{discord,slack,matrix}, docs/channels/{discord,slack,matrix}.md.
+- Official current OpenClaw source 068022e6e8df38c35d39cc5dadff40e8f58eac2d, fetched by raw GitHub on 2026-10-24: extensions/slack/{package.json,src/client-delivery.ts}, extensions/matrix/package.json. Current Slack uses the same Web API 8.2.0; current Matrix donor uses SDK 43.0.0, while this package validates 44.0.0 against offline wire fixtures.
+- Hermes local checkout 9a6108fdf29b: plugins/platforms/{discord,slack,matrix}/adapter.py and Discord adapter_media.py. Official main bda3a363e9695e3f63fce4a7ca85ba17b5fecb61 was observed through GitHub API; the current Slack adapter header confirms slack-bolt Socket Mode. Full-current Hermes behavior was not inferred from the truncated remote excerpt.
+
+The donor plugin hosts, agent runners, permissions and persistent stores are not imported. The package wraps mature SDK lifecycle and adapts the transport data to nb-im-session/1. Matrix retains a small SDK-backed sync loop so the host admission receipt controls cursor advancement.
+
+Existing adapters:
+
+- @larksuiteoapi/node-sdk@1.76.0 — Feishu/Lark official Node SDK. Long-connection and IM calls go through this SDK. License: MIT (see the package LICENSE).
+- ws@8.22.0 — WebSocket client and server used for OneBot v11 forward and reverse sockets. License: MIT (see the package LICENSE).
+
+Telegram and WeChat iLink use the platform HTTPS endpoints through an injectable transport. The iLink field names follow @tencent-weixin/openclaw-weixin@2.4.10 (MIT, Tencent), which was read as the vendor contract and is not a runtime dependency. Notification code adapted before 0.2.0 is unchanged. Those mappings derive from Apprise 1.13.1 (BSD-2-Clause, commit 1fe1f703ab6eba7c95113123d7032b9ea32d467c) and Message-Push-Nest / nb-message (Apache-2.0; engigu attribution). No donor server, UI or Python runtime is bundled.
+
+0.2.1 aligns optional getUpdates return codes and direct-chat capability with Tencent/openclaw-weixin at 874637a0dbc24050f72d1385add4fc6170a2d726 (MIT): src/api/types.ts, src/monitor/monitor.ts, src/channel.ts. Feishu thread replies use the pinned SDK's im.message.reply API and the official reply_in_thread contract: https://open.feishu.cn/document/server-docs/im-v1/message/reply.
