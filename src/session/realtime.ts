@@ -29,6 +29,14 @@ function kind(mime: string, voice = false): SessionMediaKind {
 interface Attachment { url: string; filename: string; mime: string; size: number; kind: SessionMediaKind }
 interface Message {
   id: string; chat: string; sender: string; topic: string; private: boolean; text: string; files: Attachment[];
+  /** Authored by the connected bot/account itself. */
+  self: boolean;
+  op: 'create' | 'edit' | 'retract';
+  /** Platform message the event is about (for edit/retract: the original message). */
+  source: string;
+  reply: string;
+  timestamp?: number; senderName?: string; chatTitle?: string; topicTitle?: string; replyTo?: string;
+  mentionIds: string[]; mentioned: boolean;
 }
 function attachment(input: Record<string, unknown>, platform: RealtimeSpec['platform']): Attachment {
   const mime = str(input.content_type || input.mimetype) || 'application/octet-stream';
@@ -37,42 +45,117 @@ function attachment(input: Record<string, unknown>, platform: RealtimeSpec['plat
     size: typeof input.size === 'number' ? input.size : 0,
     kind: kind(mime, platform === 'discord' && typeof input.duration_secs === 'number') };
 }
+function name(...values: unknown[]): string | undefined {
+  for (const value of values) if (typeof value === 'string' && value.trim()) return value.slice(0, 512);
+  return undefined;
+}
+function millis(value: unknown): number | undefined {
+  const ms = typeof value === 'number' ? value : typeof value === 'string' ? Date.parse(value) : NaN;
+  return Number.isSafeInteger(Math.trunc(ms)) && ms > 0 ? Math.trunc(ms) : undefined;
+}
+function slackMillis(ts: unknown): number | undefined {
+  const match = /^(\d{1,12})\.(\d{1,6})$/.exec(str(ts));
+  return match ? Number(match[1]) * 1000 + Number(match[2]!.padEnd(3, '0').slice(0, 3)) : undefined;
+}
+// Slack user mentions are `<@ID>` or `<@ID|label>`; `<!here>`/`<#C…>` are not users.
+const SLACK_MENTION = /<@([^|>\s]+)(?:\|[^>]*)?>/g;
+function unique(ids: string[]): string[] { return [...new Set(ids.filter(Boolean))].slice(0, 100); }
 // The wire mappings follow OpenClaw/Hermes channel implementations. SDKs own protocol lifecycle.
-function normalize(platform: RealtimeSpec['platform'], raw: unknown): Message | undefined {
+function normalize(platform: RealtimeSpec['platform'], raw: unknown, accountId: string): Message | undefined {
   const e = object(raw);
+  const mine = (sender: string): boolean => accountId !== '' && sender === accountId;
   if (platform === 'discord') {
-    if (object(e.author).bot || e.webhook_id) return;
+    const author = object(e.author);
+    const sender = str(author.id);
+    if ((author.bot || e.webhook_id) && !mine(sender)) return;
     const channel = object(e.channel);
     const threaded = [10, 11, 12].includes(Number(channel.type));
+    const mentionIds = unique((Array.isArray(e.mentions) ? e.mentions : []).map((m) => typeof m === 'string' ? m : str(object(m).id)));
+    const repliedTo = str(object(object(e.referenced_message).author).id);
+    const replyTo = Number(e.type) === 19 ? str(object(e.message_reference).message_id) : '';
     return { id: str(e.id), chat: threaded ? str(channel.parent_id) : str(e.channel_id),
-      sender: str(object(e.author).id), topic: threaded ? str(e.channel_id) : '0',
+      sender, topic: threaded ? str(e.channel_id) : '0',
       private: channel.type === 1, text: str(e.content),
-      files: (Array.isArray(e.attachments) ? e.attachments : []).map((a) => attachment(object(a), platform)) };
+      files: (Array.isArray(e.attachments) ? e.attachments : []).map((a) => attachment(object(a), platform)),
+      self: mine(sender), op: 'create', source: str(e.id), reply: str(e.id),
+      timestamp: millis(e.timestamp), senderName: name(object(e.member).nick, author.global_name, author.username),
+      chatTitle: name(threaded ? channel.parent_name : channel.name), topicTitle: threaded ? name(channel.name) : undefined,
+      ...(replyTo ? { replyTo } : {}), mentionIds, mentioned: mentionIds.includes(accountId) || mine(repliedTo) };
   }
   if (platform === 'slack') {
     const event = object(e.event);
     if (event.type !== 'message' && event.type !== 'app_mention') return;
-    if (event.bot_id || (event.subtype && event.subtype !== 'file_share')) return;
-    return { id: str(e.event_id) || `${str(event.channel)}:${str(event.ts)}`, chat: str(event.channel),
-      sender: str(event.user), topic: str(event.thread_ts) || '0', private: event.channel_type === 'im',
-      text: str(event.text), files: (Array.isArray(event.files) ? event.files : []).map((a) => attachment(object(a), platform)) };
+    const id = str(e.event_id) || `${str(event.channel)}:${str(event.ts)}`;
+    const thread = (m: Record<string, unknown>): string => str(m.thread_ts) && m.thread_ts !== m.ts ? str(m.thread_ts) : '0';
+    const base = { id, chat: str(event.channel), private: event.channel_type === 'im', files: [] as Attachment[],
+      mentionIds: [] as string[], mentioned: false };
+    if (event.subtype === 'message_changed') {
+      const m = object(event.message);
+      // Link unfurls also arrive as message_changed; only a user edit carries `edited`.
+      if (!object(m.edited).ts || (m.bot_id && !mine(str(m.user)))) return;
+      const mentionIds = unique([...str(m.text).matchAll(SLACK_MENTION)].map((x) => x[1]!));
+      return { ...base, sender: str(m.user), topic: thread(m), text: str(m.text), self: mine(str(m.user)),
+        op: 'edit', source: str(m.ts), reply: str(m.ts), timestamp: slackMillis(object(m.edited).ts),
+        mentionIds, mentioned: mentionIds.includes(accountId) };
+    }
+    if (event.subtype === 'message_deleted') {
+      const m = object(event.previous_message);
+      if (m.bot_id && !mine(str(m.user))) return;
+      return { ...base, sender: str(m.user), topic: thread(m), text: '', self: mine(str(m.user)),
+        op: 'retract', source: str(event.deleted_ts), reply: str(event.deleted_ts), timestamp: slackMillis(event.ts) };
+    }
+    const sender = str(event.user);
+    if ((event.bot_id && !mine(sender)) || (event.subtype && event.subtype !== 'file_share')) return;
+    const mentionIds = unique([...str(event.text).matchAll(SLACK_MENTION)].map((x) => x[1]!));
+    const topic = str(event.thread_ts) || '0';
+    const profile = object(event.user_profile);
+    return { ...base, sender, topic, text: str(event.text),
+      files: (Array.isArray(event.files) ? event.files : []).map((a) => attachment(object(a), platform)),
+      self: mine(sender), op: 'create', source: str(event.ts), reply: str(event.ts), timestamp: slackMillis(event.ts),
+      senderName: name(profile.display_name, profile.real_name, profile.name),
+      ...(topic !== '0' && topic !== str(event.ts) ? { replyTo: topic } : {}), mentionIds,
+      mentioned: event.type === 'app_mention' || mentionIds.includes(accountId) ||
+        (topic !== '0' && topic !== str(event.ts) && mine(str(event.parent_user_id))) };
+  }
+  const sender = str(e.sender);
+  const meta = { id: str(e.event_id), chat: str(e.room_id), sender, private: e.is_direct === true, self: mine(sender),
+    timestamp: millis(e.origin_server_ts), senderName: name(e.sender_name), chatTitle: name(e.room_name) };
+  if (e.type === 'm.room.redaction') {
+    const redacts = str(e.redacts) || str(object(e.content).redacts);
+    return { ...meta, topic: '0', text: '', files: [], op: 'retract', source: redacts, reply: meta.id,
+      mentionIds: [], mentioned: false };
   }
   if (e.type !== 'm.room.message') return;
   const c = object(e.content);
   const rel = object(c['m.relates_to']);
-  if (rel.rel_type === 'm.replace') return;
+  const mentionsOf = (content: Record<string, unknown>): string[] => {
+    const intentional = object(content['m.mentions']);
+    if (Array.isArray(intentional.user_ids)) return unique(intentional.user_ids.map((u) => str(u)));
+    // Legacy clients only link the user ("pill") in formatted_body.
+    return unique([...str(content.formatted_body).matchAll(/https:\/\/matrix\.to\/#\/((?:@|%40)[^"'<>?/\s]+)/g)]
+      .map((x) => { try { return decodeURIComponent(x[1]!); } catch { return ''; } }));
+  };
+  if (rel.rel_type === 'm.replace') {
+    const next = object(c['m.new_content']);
+    const mentionIds = mentionsOf(next);
+    return { ...meta, topic: '0', text: str(next.body), files: [], op: 'edit', source: str(rel.event_id),
+      reply: str(rel.event_id), mentionIds, mentioned: mentionIds.includes(accountId) };
+  }
   const info = object(c.info);
   const msgtype = str(c.msgtype);
   const media = ['m.image', 'm.file', 'm.audio', 'm.video'].includes(msgtype);
   if (c.file) return; // E2EE is deliberately not advertised; encrypted attachments need a crypto store.
   const mime = str(info.mimetype) || 'application/octet-stream';
-  return { id: str(e.event_id), chat: str(e.room_id), sender: str(e.sender),
-    topic: rel.rel_type === 'm.thread' ? str(rel.event_id) : '0', private: e.is_direct === true,
+  const inReplyTo = rel.is_falling_back === true ? '' : str(object(rel['m.in_reply_to']).event_id);
+  const mentionIds = mentionsOf(c);
+  return { ...meta, topic: rel.rel_type === 'm.thread' ? str(rel.event_id) : '0',
     text: media ? (c.filename && c.filename !== c.body ? str(c.body) : '') : str(c.body),
     files: media ? [{ url: str(c.url), filename: str(c.filename || c.body) || 'attachment', mime,
       size: typeof info.size === 'number' ? info.size : 0,
       kind: c['org.matrix.msc3245.voice'] ? 'voice' : msgtype === 'm.image' ? 'image' :
-        msgtype === 'm.video' ? 'video' : msgtype === 'm.audio' ? 'audio' : 'file' }] : [] };
+        msgtype === 'm.video' ? 'video' : msgtype === 'm.audio' ? 'audio' : 'file' }] : [],
+    op: 'create', source: meta.id, reply: meta.id, ...(inReplyTo ? { replyTo: inReplyTo } : {}),
+    mentionIds, mentioned: mentionIds.includes(accountId) };
 }
 export function createRealtimeSessionAdapter(spec: RealtimeSpec, store: SessionCursorStore,
   connection: RealtimeConnection): SessionAdapter {
@@ -103,11 +186,13 @@ export function createRealtimeSessionAdapter(spec: RealtimeSpec, store: SessionC
               onEvent(raw) {
                 const task = chain.then(async () => {
                   if (signal.aborted) return;
-                  const message = normalize(spec.platform, raw);
-                  if (!message || !message.id || !message.chat || !message.sender || message.sender === accountId) return;
+                  const message = normalize(spec.platform, raw, accountId);
+                  if (!message || !message.id || !message.chat || !message.sender) return;
+                  if (message.self && !spec.include_self) return;
+                  if (message.op !== 'create' && (!spec.include_edits || !message.source)) return;
                   const baseKey = `${spec.platform}:${accountId}:${message.id}`;
                   const eventKey = `${baseKey}:0`;
-                  const count = message.files.length ? 1 : (message.text ? 1 : 0);
+                  const count = message.op === 'retract' || message.files.length ? 1 : (message.text ? 1 : 0);
                   if (!count || recent.includes(eventKey)) return;
                   const captionField = message.text ? { caption: message.text } : {};
                   let payload: SessionInbound['payload'];
@@ -151,9 +236,16 @@ export function createRealtimeSessionAdapter(spec: RealtimeSpec, store: SessionC
                   }
                   const inbound: SessionInbound = { event_key: eventKey, platform_event_id: message.id,
                     identity: { platform: spec.platform, account_id: accountId, chat_id: message.chat,
-                      sender_id: message.sender, topic_id: message.topic || '0', chat_kind: message.private ? 'private' : 'group' },
-                    payload, reply_context: spec.platform === 'slack' ? str(object(object(raw).event).ts) : message.id,
-                    cursor: message.id };
+                      sender_id: message.sender, topic_id: message.topic || '0', chat_kind: message.private ? 'private' : 'group',
+                      ...(message.chatTitle ? { chat_title: message.chatTitle } : {}),
+                      ...(message.senderName ? { sender_name: message.senderName } : {}),
+                      ...(message.topicTitle ? { topic_title: message.topicTitle } : {}) },
+                    payload, ...(message.source ? { source_message_id: message.source } : {}), operation: message.op,
+                    ...(message.timestamp !== undefined ? { timestamp: message.timestamp } : {}),
+                    mentioned: message.mentioned, mention_ids: message.mentionIds,
+                    ...(message.replyTo ? { reply_to_message_id: message.replyTo } : {}),
+                    ...(message.self ? { is_self: true } : {}),
+                    reply_context: message.reply, cursor: message.id };
                   while (!signal.aborted) {
                     const admitted = await sink.admit(inbound).catch(() => ({ decision: 'defer' as const }));
                     if (admitted.decision === 'accepted') {

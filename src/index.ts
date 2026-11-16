@@ -22,7 +22,7 @@ export type { OutboundHttpTransport, OutboundHttpRequest, PrivateEndpointGrant,
 export { SESSION_CONTRACT, TELEGRAM_TEXT_CHARACTERS, TELEGRAM_CAPTION_CHARACTERS,
   TELEGRAM_CALLBACK_DATA_BYTES, TELEGRAM_DOWNLOAD_BYTES, TELEGRAM_IMAGE_BYTES,
   TELEGRAM_FILE_BYTES, TELEGRAM_VOICE_BYTES, FEISHU_TEXT_UTF8_BYTES, FEISHU_CARD_UTF8_BYTES,
-  FEISHU_IMAGE_BYTES, FEISHU_FILE_BYTES, splitSessionText, splitFeishuText } from './session/contract.ts';
+  FEISHU_IMAGE_BYTES, FEISHU_FILE_BYTES, WECOM_AIBOT_MARKDOWN_UTF8_BYTES, splitSessionText, splitFeishuText } from './session/contract.ts';
 export type { SessionAccount, SessionAdmit, SessionAdapter, SessionButton, SessionChatKind, SessionConnectionDetail,
   SessionCursorStore, SessionIdentity, SessionInbound, SessionInboundPart, SessionInboundPayload,
   SessionInboundUnavailableReason, SessionLimits, SessionMedia,
@@ -39,7 +39,12 @@ export { createWechatSessionAdapter } from './session/wechat.ts';
 export { createDiscordSessionAdapter, createDiscordConnection } from './session/discord.ts';
 export { createSlackSessionAdapter, createSlackConnection } from './session/slack.ts';
 export { createMatrixSessionAdapter, createMatrixConnection } from './session/matrix.ts';
-export type { RealtimeConnection, RealtimeRequest, RealtimeHandlers, SessionMediaKind } from './session/contract.ts';
+export { createWecomAibotSessionAdapter, createWecomAibotTransport, decryptWecomMedia, WECOM_AIBOT_URL } from './session/wecom-aibot.ts';
+export { createScriptSessionAdapter, SCRIPT_PROTOCOL, SCRIPT_TEXT_CHARACTERS, SCRIPT_MEDIA_BYTES,
+  SCRIPT_LINE_BYTES } from './session/script.ts';
+export { sessionFingerprint } from './session/registry.ts';
+export type { RealtimeConnection, RealtimeRequest, RealtimeHandlers, SessionMediaKind, WecomAibotDownload, WecomAibotLink,
+  WecomAibotTransport } from './session/contract.ts';
 export { PlatformFault } from './session/realtime.ts';
 export { SESSION_CAPABILITIES, SESSION_SETUP, createSlackManifest, slackManifestInstallUrl,
   discordInstallUrl, slackOAuthUrl, exchangeSlackOAuth, discoverMatrix, matrixSsoUrl,

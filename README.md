@@ -1,6 +1,6 @@
 # @nb-corp/nb-im
 
-Bidirectional messaging sessions and a separate durable notification outbox for Node >=24.15. Version 0.3.1 includes Discord, Slack and unencrypted Matrix sessions alongside the Telegram, Feishu, OneBot v11 and WeChat iLink adapters, plus Node 24 pinned IPv4, multipart rich-message ordering, and inbound reconnect watchdogs. The adapters use pinned SDKs, return typed receipts, and leave authorization and agent turns to the host.
+Bidirectional messaging sessions and a separate durable notification outbox for Node >=24.15. Version 0.3.1 includes Discord, Slack, unencrypted Matrix and WeCom AI-bot sessions alongside the Telegram, Feishu, OneBot v11 and WeChat iLink adapters, plus Node 24 pinned IPv4, multipart rich-message ordering, and inbound reconnect watchdogs. The adapters use pinned SDKs, return typed receipts, and leave authorization and agent turns to the host.
 
 ## Receive a message and reply
 
@@ -37,6 +37,29 @@ await hub.release(spec);
 
 A receipt of `accepted` means the platform accepted the operation. It does not mean a person read it. Cancellation before dispatch returns `failed/cancelled`; interruption after an external request may have started returns `unknown/cancelled_after_dispatch`. Do not automatically replay an unknown send.
 
+## Inbound metadata
+
+Besides `identity`, `payload` and `reply_context`, a `SessionInbound` carries optional metadata copied from the platform payload. A field is absent when the platform did not send it; nb-im never fabricates it.
+
+| Field | Meaning | Populated by |
+| --- | --- | --- |
+| `identity.chat_kind` | `private` or `group` | all adapters (Telegram/Feishu when the chat type is known) |
+| `identity.sender_name` | display name of the sender | Telegram, OneBot (`card` or `nickname`), Discord (nick, global or user name), Slack (`user_profile`, when sent), Matrix (member names seen in sync), script |
+| `identity.chat_title` | group/channel/room name | Telegram, OneBot (`group_name`, when the implementation sends it), Discord (channel; parent channel for threads), Matrix (`m.room.name` seen in sync), script |
+| `timestamp` | send time, ms since epoch | all adapters |
+| `mentioned`, `mention_ids` | the bot was addressed / IDs that were @-mentioned | Telegram, Feishu, OneBot (`at`), Discord (also a reply to the bot), Slack (`<@…>`, `app_mention`, a reply in a thread the bot started), Matrix (`m.mentions`, legacy pills), script |
+| `reply_to_message_id` | message this one replies to | Telegram, Feishu, OneBot (`reply`), WeChat (`ref_msg`), Discord, Slack (thread root), Matrix (`m.in_reply_to`, not the thread fallback), script |
+| `source_message_id` | platform message ID (for an edit/retract: the original message) | all adapters |
+| `operation` | `create`, `edit` or `retract`; absent means `create` | Telegram, Discord, Slack, Matrix, script |
+| `is_self` | authored by the connected bot/account | Telegram, Feishu, script; the others only with `include_self` |
+
+Two optional `SessionSpec` fields widen what is admitted. Both default to `false`, which keeps today's behaviour:
+
+- `include_self: true` admits the account's own messages with `is_self: true`: Discord/Slack/Matrix messages from the bot user, WeChat iLink bot messages, OneBot `post_type: 'message_sent'` (private ones use `target_id` as `chat_id`). Hosts that act on inbound messages must not answer these.
+- `include_edits: true` admits Slack `message_changed` (user edits only, not link unfurls) / `message_deleted` and Matrix `m.replace` / `m.room.redaction` as `operation: 'edit' | 'retract'`. `source_message_id` names the original message, an edit's payload is the new text, a retract's is empty text, and each has its own `event_key`. A Matrix edit does not carry its thread, so its `topic_id` is `'0'`; a redaction's `sender_id` is whoever redacted.
+
+Options other than credentials are not part of the session fingerprint: the first `acquire` of a credential decides them.
+
 ## Configure the new sessions
 
 `SESSION_SETUP` exposes setup methods, required credential fields and instructions. `SESSION_CAPABILITIES` describes the three new adapters; it is not the notification-provider registry. Hosts should render these descriptors rather than infer support from a platform name.
@@ -70,6 +93,14 @@ This adapter uses `matrix-js-sdk@44.0.0` and joined **unencrypted** rooms. Join 
 
 The first sync establishes a baseline without replaying old room history. Later sync tokens advance only after covered events are admitted. Discord's gateway resumes within a connection lifetime; Slack envelopes are acknowledged after host admission and follow Slack's retry window. These transports do not provide an unlimited offline inbox. All three retain bounded accepted-event keys for deduplication; the host should also deduplicate durable admission by `event_key`.
 
+### WeCom AI bot (`wecom_aibot`)
+
+`SessionSpec` fields: `bot_id`, `secret`. In the WeCom admin console, open the AI bot (智能机器人), choose API mode with the **long connection** (长连接), and copy its Bot ID and long-connection Secret; no public URL, Token or EncodingAESKey is needed. The adapter connects to `wss://openws.work.weixin.qq.com`, subscribes (`aibot_subscribe`), pings every 30 s and reconnects with back-off. WeCom keeps one connection per bot: when another client subscribes with the same bot, this one receives `disconnected_event` and stops in `conflict` instead of taking the bot back. Three refused subscribes end in `auth_expired`. The fingerprint is the bot id alone.
+
+What WeCom delivers: every DM message (text, image, text+image, voice as its transcript, file, video) and, in groups, only messages that @ the bot (text, text+image, quotes). `chat_id` is the group's `chatid` or, in a DM, the sender's `userid`; `sender_id` is the `userid` (plain text only when the bot's creator is a super admin). WeCom sends no display names or chat titles. Every event is `mentioned: true`. Media URLs are valid five minutes and encrypted per URL (`aeskey`); the adapter downloads them over pinned public HTTPS (30 MiB cap) and decrypts them (`decryptWecomMedia`). A quoted message becomes `quoted_text`.
+
+Sending: the first reply to a callback within five minutes answers it (`aibot_respond_msg`, one finished stream, `reply_context` carries the callback's `req_id`); everything else is a push (`aibot_send_msg`, markdown up to 20,480 UTF-8 bytes, or media), which WeCom accepts only in chats where the user has talked to the bot. Media is uploaded as temporary material over the connection (512 KB chunks): images (png/jpeg/gif) and mp4 video up to 10 MiB, amr voice up to 2 MiB, anything else as a file up to 20 MiB. Edits and buttons are `unsupported`. WeCom limits each conversation to 30 messages a minute and 1,000 an hour; a refusal is `failed` with `wecom_aibot_errcode_<n>`, a missing ack is `unknown`.
+
 ## Text and media support
 
 All three new adapters receive/send text, images, files, audio and video bytes; they support thread replies and text edits. Multiple attachments become separately keyed inbound media events with the message's caption. Files are downloaded, not handed to the host as remote URLs. Discord/Slack downloads use allowlisted, DNS-pinned public CDN connections; Slack bearer credentials are only attached to its designated file hosts. Matrix uses authenticated homeserver media download. Downloads and sends respect these package caps; a server may enforce a lower limit.
@@ -85,6 +116,71 @@ All three new adapters receive/send text, images, files, audio and video bytes; 
 **Voice notes are distinct from audio.** The new adapters recognize native inbound Discord voice attachments and Matrix voice markers, but reject outbound `kind:'voice'` with `${platform}_native_voice_unsupported`. They do not invent duration, waveform or codec metadata. Use explicit `kind:'audio'` to send an ordinary attachment in Discord/Slack or `m.audio` in Matrix; that is not a native voice-note promise. Existing Telegram/Feishu/OneBot/WeChat voice behavior is unchanged. The old four adapters reject the newly added `audio`/`video` kinds instead of silently coercing them to an image or file.
 
 `auth_expired` requires replacing credentials and reacquiring the session. Transient receive failures use the existing bounded reconnect backoff and expose redacted `connection_detail`. `stop()` aborts owned receive work and in-flight sends that use the session signal; stopped instances are removed from the shared pool.
+
+## Custom channels (script)
+
+`platform: 'script'` runs any executable as a channel. nb-im spawns `command` (argv array, no shell) with `cwd` and a minimal environment (`PATH`, `HOME`, `LANG`, `LC_ALL`, `TZ`, `TMPDIR`, plus `env` and `NB_IM_PROTOCOL`, `NB_IM_INSTANCE_ID`); host secrets are not inherited. The two speak protocol `nb-im-script/1`: one UTF-8 JSON object per `\n`-terminated line on stdin/stdout. stderr lines go to `on_log`.
+
+```ts
+const spec = { platform: 'script', instance_id: 'my-channel',
+  command: [process.execPath, '/abs/path/script-channel-echo.mjs'],
+  env: { MY_TOKEN: secrets.token }, on_log: (line) => logger.info(line) } as const;
+```
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `command`, `cwd`, `env` | — | Process to run. Together they form the session fingerprint (one live process per distinct triple). |
+| `send_timeout_ms` | 30000 | A send without a `receipt` in time resolves `unknown/script_send_timeout`. |
+| `max_line_bytes` | 40 MiB (`SCRIPT_LINE_BYTES`) | Longest accepted stdout line. Longer lines are never buffered: nb-im logs, kills and restarts the script. |
+| `retry_ms` | 1000 | Restart backoff base (doubles per consecutive failure, max 30 s) and admit-retry delay. |
+
+### nb-im → script (stdin)
+
+| `type` | Fields | When |
+| --- | --- | --- |
+| `hello` | `protocol: "nb-im-script/1"`, `instance_id`, `cursor: string \| null` | First line of every process start. `cursor` is the `cursor` of the last message the host admitted (`null` if none yet). Resume from there. |
+| `admitted` | `id` | The host durably accepted message `id` (also re-sent for an `id` it had already accepted). Safe to drop it from the script's own queue. |
+| `send` | `id`, `message` | Deliver a `SessionOutbound` (`text`, `edit_text`, `text_parts`, `media`, `callback_ack`). For `media`, `message.media` is `{kind, filename, mime, data}` with the bytes base64 in `data`. Answer with one `receipt` carrying the same `id`. |
+
+### script → nb-im (stdout)
+
+| `type` | Fields | Meaning |
+| --- | --- | --- |
+| `ready` | `account_id?` | Required after `hello`. Marks the session `running` (sends are refused before it) and sets `account.account_id` (default: `instance_id`). |
+| `message` | required `id`, `chat_id`, `sender_id`, and `text` and/or `media`; optional `cursor`, `op`, `message_id`, `topic_id`, `topic_title`, `chat_kind` (`private`\|`group`), `chat_title`, `sender_name`, `timestamp` (ms), `mentioned`, `mention_ids`, `reply_to`, `quoted_text`, `is_self`, `reply_context` | One inbound event. `media` is an array of `{kind: image\|file\|voice\|audio\|video, filename, mime, data}` (base64, ≤ 25 MiB each). `op` is `create` (default), `edit` or `retract`. `id` matches `[A-Za-z0-9_.$=+/:~@#-]{1,255}` and **must be stable across restarts**: `event_key` is `script:<instance_id>:<id>`, so replays are deduplicated. `cursor` (default: `id`) is opaque to nb-im, stored only after admission, and handed back in the next `hello`. `reply_context` (default: `id`) comes back in `send.message.target.reply_context`. |
+| `receipt` | `id`, `status` (`accepted`\|`failed`\|`unknown`), `message_ids?`, `error_kind?`, `code?` | Result of `send` `id`. `error_kind` is a `SessionErrorKind`; `code` is `[a-z0-9_]{1,64}`. |
+| `error` | `code`, `message?` | `code: "auth_expired"` or `"conflict"` stops the session in that state without restart; other codes are only logged. |
+| `log` | `message` | Forwarded to `on_log`. |
+
+Messages are admitted one at a time in order; nb-im stops reading stdout while 64 are queued. Non-JSON lines, unknown `type`s and malformed `message` lines are logged and skipped.
+
+### Lifecycle
+
+- On POSIX the script is the leader of its own process group. `stop()` closes its stdin, sends `SIGTERM` to the whole group and `SIGKILL` 3 s later. The group is signalled the same way whenever the leader exits, so helpers it spawned (pollers, browsers) do not outlive it. Helpers that create their own session/group are out of reach.
+- **The script must exit when stdin reaches EOF.** If the host exits normally nb-im also sends `SIGTERM` to live groups, but EOF is the only signal left after a hard host kill.
+- When the script exits or crashes, sends still waiting for a receipt resolve `unknown/script_exited`, and nb-im restarts it with backoff and a new `hello` carrying the last admitted cursor.
+
+[`examples/script-channel-echo.mjs`](examples/script-channel-echo.mjs) is a complete channel: it greets once, then echoes each send back as an inbound message.
+
+```js
+import { createInterface } from 'node:readline';
+const out = (value) => process.stdout.write(`${JSON.stringify(value)}\n`);
+let n = 0;
+// The loop ends when stdin closes, so the script exits with the host.
+for await (const raw of createInterface({ input: process.stdin })) {
+  const line = JSON.parse(raw);
+  if (line.type === 'hello') {
+    out({ type: 'ready', account_id: 'echo-bot' });
+    if (!line.cursor) out({ type: 'message', id: 'hello-1', chat_id: 'room-1', chat_kind: 'group',
+      sender_id: 'alice', sender_name: 'Alice', text: 'Hello from a script channel', timestamp: Date.now(), cursor: 'c1' });
+  } else if (line.type === 'send') {
+    n += 1;
+    out({ type: 'receipt', id: line.id, status: 'accepted', message_ids: [`out-${n}`] });
+    if (line.message.type === 'text') out({ type: 'message', id: `echo-${n}`, chat_id: line.message.target.chat_id,
+      sender_id: 'echo', text: `echo: ${line.message.text}`, timestamp: Date.now(), cursor: `c${n + 1}` });
+  }
+}
+```
 
 ## Notification outbox (unchanged interface)
 

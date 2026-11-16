@@ -12,6 +12,12 @@ export function sessionFingerprint(spec: SessionSpec): string {
   else if (spec.platform === 'personal_wechat') secret = spec.token;
   else if (spec.platform === 'discord') secret = spec.bot_token;
   else if (spec.platform === 'slack') secret = `${spec.bot_token}\0${spec.app_token}`;
+  else if (spec.platform === 'script') {
+    const env = Object.entries(spec.env ?? {}).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0);
+    secret = JSON.stringify([spec.command, spec.cwd ?? '', env]);
+  }
+  // WeCom keeps one live connection per bot whatever the secret, so the bot id alone is the credential.
+  else if (spec.platform === 'wecom_aibot') secret = spec.bot_id;
   else if (spec.platform === 'matrix') secret = `${new URL(spec.homeserver).href.replace(/\/$/, '')}\0${spec.access_token}`;
   else secret = `${spec.mode}\0${spec.endpoint}\0${spec.listen_port ?? ''}\0${spec.access_token ?? ''}`;
   return createHash('sha256').update(`${spec.platform}\0${secret}`).digest('hex');

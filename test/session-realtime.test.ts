@@ -127,3 +127,153 @@ test('realtime adapter preserves caption on failed single attachment and coalesc
   });
   await hub.release(spec);
 });
+
+async function collect(spec: SessionSpec, f: ReturnType<typeof fixture>, raws: unknown[]): Promise<SessionInbound[]> {
+  const hub = createSessionHub({ store: f.store });
+  const adapter = hub.acquire(spec);
+  const received: SessionInbound[] = [];
+  await adapter.start({ async admit(event) { received.push(event); return { decision: 'accepted' }; } });
+  for (const raw of raws) await f.handlers.onEvent(raw);
+  await hub.release(spec);
+  return received;
+}
+
+test('discord inbound metadata: names, timestamp, mentions, reply-to-bot and reply id', async () => {
+  const f = fixture();
+  const [thread, reply, plain] = await collect({ platform: 'discord', bot_token: 'discord-meta', instance_id: 'discord-meta',
+    retry_ms: 1, connection: f.connection }, f, [
+    { id: '300', type: 0, channel_id: '22', channel: { type: 11, parent_id: '11', name: 'release-42', parent_name: 'deploys' },
+      author: { id: 'user', username: 'alice', global_name: 'Alice' }, member: { nick: 'Alice (ops)' },
+      timestamp: '2024-01-02T03:04:05.678Z', content: '<@bot> <@other> ship it', mentions: [{ id: 'bot' }, { id: 'other' }] },
+    { id: '301', type: 19, channel_id: '11', channel: { type: 0, name: 'deploys' }, author: { id: 'user', username: 'alice' },
+      content: 'thanks', mentions: [], message_reference: { message_id: '299' }, referenced_message: { author: { id: 'bot' } } },
+    { id: '302', channel_id: '33', channel: { type: 1 }, author: { id: 'user', username: 'alice' }, content: 'dm' },
+  ]);
+  assert.deepEqual(thread?.identity, { platform: 'discord', account_id: 'bot', chat_id: '11', sender_id: 'user', topic_id: '22',
+    chat_kind: 'group', chat_title: 'deploys', sender_name: 'Alice (ops)', topic_title: 'release-42' });
+  assert.equal(thread?.timestamp, Date.parse('2024-01-02T03:04:05.678Z'));
+  assert.equal(thread?.mentioned, true);
+  assert.deepEqual(thread?.mention_ids, ['bot', 'other']);
+  assert.equal(thread?.reply_to_message_id, undefined);
+  assert.equal(thread?.source_message_id, '300');
+  assert.equal(thread?.operation, 'create');
+  assert.equal(reply?.mentioned, true, 'a reply to the bot counts as addressing it');
+  assert.equal(reply?.reply_to_message_id, '299');
+  assert.equal(reply?.identity.sender_name, 'alice');
+  assert.equal(plain?.mentioned, false);
+  assert.equal(plain?.identity.chat_kind, 'private');
+  assert.equal(plain?.identity.chat_title, undefined);
+});
+
+test('slack inbound metadata: profile name, ts timestamp, <@> mentions, app_mention and thread reply to the bot', async () => {
+  const f = fixture();
+  const events = await collect({ platform: 'slack', bot_token: 'slack-meta', app_token: 'app', instance_id: 'slack-meta',
+    retry_ms: 1, connection: f.connection }, f, [
+    { event_id: 'Ev1', event: { type: 'message', channel: 'C1', channel_type: 'channel', user: 'U1', ts: '1700000000.123456',
+      text: 'hey <@bot> and <@U2|bob>', user_profile: { display_name: '', real_name: 'Alice Smith', name: 'alice' } } },
+    { event_id: 'Ev2', event: { type: 'message', channel: 'C1', channel_type: 'channel', user: 'U1', ts: '1700000001.000100',
+      thread_ts: '1700000000.000001', parent_user_id: 'bot', text: 'replying in your thread' } },
+    { event_id: 'Ev3', event: { type: 'app_mention', channel: 'C1', user: 'U1', ts: '1700000002.000000', text: 'ping' } },
+  ]);
+  const [mention, threadReply, appMention] = events;
+  assert.equal(mention?.identity.sender_name, 'Alice Smith');
+  assert.equal(mention?.timestamp, 1_700_000_000_123);
+  assert.equal(mention?.mentioned, true);
+  assert.deepEqual(mention?.mention_ids, ['bot', 'U2']);
+  assert.equal(mention?.source_message_id, '1700000000.123456');
+  assert.equal(threadReply?.mentioned, true);
+  assert.equal(threadReply?.reply_to_message_id, '1700000000.000001');
+  assert.equal(threadReply?.identity.topic_id, '1700000000.000001');
+  assert.equal(appMention?.mentioned, true);
+});
+
+test('matrix inbound metadata: room/member names, origin_server_ts, m.mentions, legacy pills and real replies only', async () => {
+  const f = fixture();
+  const events = await collect({ platform: 'matrix', homeserver: 'https://matrix.example', access_token: 'matrix-meta',
+    instance_id: 'matrix-meta', retry_ms: 1, connection: f.connection }, f, [
+    { type: 'm.room.message', event_id: '$1', room_id: '!r:example', sender: '@alice:example', origin_server_ts: 1_700_000_000_000,
+      room_name: 'Ops', sender_name: 'Alice', content: { msgtype: 'm.text', body: 'hi bot', 'm.mentions': { user_ids: ['bot'] },
+        'm.relates_to': { 'm.in_reply_to': { event_id: '$0' } } } },
+    { type: 'm.room.message', event_id: '$2', room_id: '!r:example', sender: '@alice:example',
+      content: { msgtype: 'm.text', body: 'bob: hi', formatted_body: '<a href="https://matrix.to/#/%40bob%3Aexample">bob</a>: hi',
+        'm.relates_to': { rel_type: 'm.thread', event_id: '$root', is_falling_back: true, 'm.in_reply_to': { event_id: '$root' } } } },
+  ]);
+  const [direct, threaded] = events;
+  assert.equal(direct?.identity.chat_title, 'Ops');
+  assert.equal(direct?.identity.sender_name, 'Alice');
+  assert.equal(direct?.timestamp, 1_700_000_000_000);
+  assert.equal(direct?.mentioned, true);
+  assert.equal(direct?.reply_to_message_id, '$0');
+  assert.deepEqual(threaded?.mention_ids, ['@bob:example']);
+  assert.equal(threaded?.mentioned, false);
+  assert.equal(threaded?.reply_to_message_id, undefined, 'thread fallback is not a reply');
+  assert.equal(threaded?.identity.topic_id, '$root');
+});
+
+test('own messages are dropped by default and emitted with is_self under include_self', async () => {
+  const own = {
+    discord: { id: '400', channel_id: '11', channel: { type: 0 }, author: { id: 'bot', bot: true }, content: 'from me' },
+    slack: { event_id: 'Ev400', event: { type: 'message', channel: 'C1', channel_type: 'channel', user: 'bot', bot_id: 'B1',
+      ts: '1700000000.000400', text: 'from me' } },
+    matrix: { type: 'm.room.message', event_id: '$400', room_id: '!r:example', sender: 'bot', content: { msgtype: 'm.text', body: 'from me' } },
+  } as const;
+  const otherBot = { id: '401', channel_id: '11', channel: { type: 0 }, author: { id: 'robot', bot: true }, content: 'other bot' };
+  for (const c of cases) {
+    const base = { ...c.spec, platform: c.platform, retry_ms: 1 };
+    const off = fixture();
+    const dropped = await collect({ ...base, instance_id: `${c.platform}-self-off`, connection: off.connection } as SessionSpec, off,
+      [own[c.platform]]);
+    assert.equal(dropped.length, 0, c.platform);
+    const on = fixture();
+    const kept = await collect({ ...base, instance_id: `${c.platform}-self-on`, include_self: true, connection: on.connection } as SessionSpec,
+      on, c.platform === 'discord' ? [own.discord, otherBot] : [own[c.platform]]);
+    assert.equal(kept.length, 1, c.platform);
+    assert.equal(kept[0]?.is_self, true);
+    assert.equal(kept[0]?.identity.sender_id, 'bot');
+    assert.deepEqual(kept[0]?.payload, { type: 'text', text: 'from me' });
+  }
+});
+
+test('slack and matrix edits/retractions are dropped by default and emitted under include_edits', async () => {
+  const slackEvents = [
+    { event_id: 'Ev500', event: { type: 'message', subtype: 'message_changed', channel: 'C1', channel_type: 'channel', ts: '1700000009.000000',
+      message: { type: 'message', user: 'U1', text: 'fixed <@bot>', ts: '1700000000.000500', thread_ts: '1700000000.000001',
+        edited: { user: 'U1', ts: '1700000009.000000' } } } },
+    // Link unfurl: no `edited`, never an edit.
+    { event_id: 'Ev501', event: { type: 'message', subtype: 'message_changed', channel: 'C1', ts: '1700000010.000000',
+      message: { type: 'message', user: 'U1', text: 'see https://x', ts: '1700000000.000501', attachments: [{}] } } },
+    { event_id: 'Ev502', event: { type: 'message', subtype: 'message_deleted', channel: 'C1', ts: '1700000011.000000',
+      deleted_ts: '1700000000.000500', previous_message: { user: 'U1', text: 'fixed', ts: '1700000000.000500' } } },
+  ];
+  const matrixEvents = [
+    { type: 'm.room.message', event_id: '$e1', room_id: '!r:example', sender: '@alice:example', origin_server_ts: 1_700_000_009_000,
+      content: { msgtype: 'm.text', body: '* fixed', 'm.new_content': { msgtype: 'm.text', body: 'fixed' },
+        'm.relates_to': { rel_type: 'm.replace', event_id: '$orig' } } },
+    { type: 'm.room.redaction', event_id: '$e2', room_id: '!r:example', sender: '@alice:example', redacts: '$orig', content: {} },
+  ];
+  for (const [platform, spec, raws] of [
+    ['slack', { platform: 'slack', bot_token: 'slack-edit', app_token: 'app' }, slackEvents],
+    ['matrix', { platform: 'matrix', homeserver: 'https://matrix.example', access_token: 'matrix-edit' }, matrixEvents],
+  ] as const) {
+    const off = fixture();
+    assert.equal((await collect({ ...spec, instance_id: `${platform}-edit-off`, retry_ms: 1, connection: off.connection } as SessionSpec,
+      off, [...raws])).length, 0, platform);
+    const on = fixture();
+    const events = await collect({ ...spec, instance_id: `${platform}-edit-on`, retry_ms: 1, include_edits: true,
+      connection: on.connection } as SessionSpec, on, [...raws]);
+    assert.deepEqual(events.map((e) => [e.operation, e.source_message_id, e.payload]), platform === 'slack' ? [
+      ['edit', '1700000000.000500', { type: 'text', text: 'fixed <@bot>' }],
+      ['retract', '1700000000.000500', { type: 'text', text: '' }],
+    ] : [
+      ['edit', '$orig', { type: 'text', text: 'fixed' }],
+      ['retract', '$orig', { type: 'text', text: '' }],
+    ]);
+    assert.notEqual(events[0]?.event_key, events[1]?.event_key);
+    if (platform === 'slack') {
+      assert.equal(events[0]?.identity.topic_id, '1700000000.000001');
+      assert.equal(events[0]?.mentioned, true);
+      assert.equal(events[0]?.timestamp, 1_700_000_009_000);
+      assert.equal(events[1]?.identity.sender_id, 'U1');
+    } else assert.equal(events[0]?.timestamp, 1_700_000_009_000);
+  }
+});

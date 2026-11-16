@@ -213,7 +213,14 @@ function buildWechat(spec: WechatSpec, store: SessionCursorStore, key: string): 
         let hold = false;
         for (const item of messages) {
           const message = record(item);
-          if (!message || message.message_type === 2) continue;
+          if (!message) continue;
+          if (message.message_type === 2) {
+            // Bot-authored (message_type 2): dropped unless the host opted in; unfinished ones never hold the batch.
+            if (spec.include_self && (typeof message.message_state !== 'number' || message.message_state === 2)) {
+              batch.push(...await eventsFrom(message, signal, nextBuf, true));
+            }
+            continue;
+          }
           if (typeof message.message_state === 'number' && message.message_state !== 2) { hold = true; break; }
           batch.push(...await eventsFrom(message, signal, nextBuf));
         }
@@ -237,14 +244,19 @@ function buildWechat(spec: WechatSpec, store: SessionCursorStore, key: string): 
     }
   }
   async function eventsFrom(message: Record<string, unknown>, signal: AbortSignal,
-    nextBuf: string): Promise<SessionInbound[]> {
+    nextBuf: string, self = false): Promise<SessionInbound[]> {
     const toUser = typeof message.to_user_id === 'string' ? message.to_user_id : '';
-    if (!spec.account_id && toUser) learned = toUser;
-    const accountId = spec.account_id || toUser || learned || 'wechat';
     const from = typeof message.from_user_id === 'string' ? message.from_user_id : '';
+    // A bot-authored message is addressed to the peer, so it never teaches the account id.
+    if (!spec.account_id && toUser && !self) learned = toUser;
+    const accountId = spec.account_id || (self ? from : toUser) || learned || 'wechat';
     const group = typeof message.group_id === 'string' && message.group_id.length > 0 ? message.group_id : '';
-    const identity: SessionIdentity = { platform: 'personal_wechat', account_id: accountId, chat_id: from,
+    const peer = self ? toUser : from;
+    if (self && (!peer || !from)) return [];
+    const identity: SessionIdentity = { platform: 'personal_wechat', account_id: accountId, chat_id: peer,
       sender_id: from, topic_id: group || '0', chat_kind: group ? 'group' : 'private' };
+    const created = message.create_time_ms;
+    const timestamp = typeof created === 'number' && Number.isSafeInteger(created) && created > 0 ? created : undefined;
     const context = typeof message.context_token === 'string' ? message.context_token : undefined;
     const items = Array.isArray(message.item_list) ? message.item_list : [];
     const events: SessionInbound[] = [];
@@ -261,6 +273,9 @@ function buildWechat(spec: WechatSpec, store: SessionCursorStore, key: string): 
       const referenceText = record(referenced?.text_item)?.text;
       const quote = typeof referenceText === 'string' && referenceText.trim() ? quotedText(referenceText) : undefined;
       const base = { event_key: eventKey, platform_event_id: messageId, identity, cursor,
+        source_message_id: messageId,
+        ...(timestamp === undefined ? {} : { timestamp }),
+        ...(self ? { is_self: true } : {}),
         ...(replyId === undefined ? {} : { reply_to_message_id: replyId }),
         ...(quote === undefined ? {} : { quoted_text: quote }),
         ...(context ? { reply_context: context } : {}) };

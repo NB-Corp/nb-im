@@ -445,3 +445,47 @@ test('WeChat default transport settles a silent 35 second poll without entering 
     mock.timers.reset();
   }
 });
+
+test('WeChat carries create_time_ms and emits bot-authored messages only with include_self', async () => {
+  const response = JSON.stringify({ ret: 0, get_updates_buf: 'self', msgs: [
+    { message_id: 'u1', from_user_id: 'friend', to_user_id: 'bot', message_type: 1, message_state: 2,
+      create_time_ms: 1_700_000_000_123, item_list: [{ type: 1, text_item: { text: 'hi bot' } }] },
+    { message_id: 'b1', from_user_id: 'bot', to_user_id: 'friend', message_type: 2, message_state: 2,
+      create_time_ms: 1_700_000_000_456, item_list: [{ type: 1, text_item: { text: 'hi friend' } }] },
+    // Still generating: never holds the batch, never emitted.
+    { message_id: 'b2', from_user_id: 'bot', to_user_id: 'friend', message_type: 2, message_state: 1,
+      item_list: [{ type: 1, text_item: { text: 'partial' } }] },
+  ] });
+  async function receive(instance: string, includeSelf: boolean): Promise<SessionInbound[]> {
+    const events: SessionInbound[] = [];
+    let polls = 0;
+    const transport: WechatTransport = {
+      async post(url) {
+        if (url.endsWith('getupdates')) return polls++ === 0 ? { status: 200, body: response } : { status: 401, body: '' };
+        return { status: 200, body: '{"ret":0}' };
+      },
+      async postBytes() { throw new Error('unexpected upload'); },
+      async getBytes() { throw new Error('unexpected download'); },
+    };
+    const adapter = createWechatSessionAdapter({ platform: 'personal_wechat', instance_id: instance, token: `offline-${instance}`,
+      transport, retry_ms: 0, ...(includeSelf ? { include_self: true } : {}) }, memory());
+    try {
+      await adapter.start({ async admit(event) { events.push(event); return { decision: 'accepted' }; } });
+      for (let i = 0; i < 40 && adapter.state !== 'auth_expired'; i += 1) await new Promise((resolve) => setTimeout(resolve, 5));
+      assert.equal(adapter.account.account_id, 'bot');
+    } finally { await adapter.stop(); }
+    return events;
+  }
+  const plain = await receive('wx.self.off', false);
+  assert.deepEqual(plain.map((e) => e.platform_event_id), ['u1']);
+  assert.equal(plain[0]?.timestamp, 1_700_000_000_123);
+  assert.equal(plain[0]?.source_message_id, 'u1');
+  assert.equal(plain[0]?.is_self, undefined);
+  const withSelf = await receive('wx.self.on', true);
+  assert.deepEqual(withSelf.map((e) => e.platform_event_id), ['u1', 'b1']);
+  assert.deepEqual(withSelf[1]?.identity, { platform: 'personal_wechat', account_id: 'bot', chat_id: 'friend',
+    sender_id: 'bot', topic_id: '0', chat_kind: 'private' });
+  assert.equal(withSelf[1]?.is_self, true);
+  assert.equal(withSelf[1]?.timestamp, 1_700_000_000_456);
+  assert.deepEqual(withSelf[1]?.payload, { type: 'text', text: 'hi friend' });
+});

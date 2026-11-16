@@ -471,3 +471,68 @@ test('OneBot reverse WS drops only the half-open role and keeps listening for it
     await adapter.stop().catch(() => undefined);
   }
 });
+
+async function oneBotFixture(instance: string, port: number, extra: { include_self?: boolean } = {}) {
+  const api = link('universal');
+  const transport: OneBotTransport = {
+    async connect() { return api; },
+    async listen() { throw new Error('onebot_listen_unused'); },
+  };
+  const events: SessionInbound[] = [];
+  const adapter = createOneBotSessionAdapter({ platform: 'qq_onebot_v11', mode: 'forward',
+    endpoint: `ws://127.0.0.1:${port}/`, instance_id: instance, transport, retry_ms: 0, ...extra }, memory());
+  await adapter.start({ async admit(event) { events.push(event); return { decision: 'accepted' }; } });
+  return { api, events, adapter };
+}
+
+test('OneBot inbound metadata: sender/group names, time, @ mentions and reply from segments and CQ codes', async () => {
+  const { api, events, adapter } = await oneBotFixture('qq.meta', 6801);
+  api.emit({ post_type: 'message', message_type: 'group', message_id: -21, self_id: 100, user_id: 200, group_id: 300,
+    time: 1_700_000_000, group_name: 'Ops room', sender: { user_id: 200, nickname: 'alice', card: 'Alice (ops)' },
+    message: [{ type: 'reply', data: { id: '-20' } }, { type: 'at', data: { qq: '100' } }, { type: 'at', data: { qq: 'all' } },
+      { type: 'at', data: { qq: 555 } }, { type: 'text', data: { text: ' deploy?' } }] });
+  api.emit({ post_type: 'message', message_type: 'private', message_id: 22, self_id: 100, user_id: 201,
+    sender: { user_id: 201, nickname: 'bob' }, message: '[CQ:reply,id=21][CQ:at,qq=555] hi' });
+  await until(() => events.length === 2, 'two events');
+  const [group, direct] = events;
+  assert.deepEqual(group?.identity, { platform: 'qq_onebot_v11', account_id: adapter.account.account_id, chat_id: '300',
+    sender_id: '200', topic_id: '0', chat_kind: 'group', chat_title: 'Ops room', sender_name: 'Alice (ops)' });
+  assert.deepEqual(group?.payload, { type: 'text', text: ' deploy?' });
+  assert.equal(group?.timestamp, 1_700_000_000_000);
+  assert.equal(group?.mentioned, true);
+  assert.deepEqual(group?.mention_ids, ['100', '555']);
+  assert.equal(group?.reply_to_message_id, '-20');
+  assert.equal(group?.source_message_id, '-21');
+  assert.equal(group?.is_self, undefined);
+  assert.equal(direct?.identity.sender_name, 'bob');
+  assert.equal(direct?.identity.chat_title, undefined);
+  assert.equal(direct?.mentioned, false);
+  assert.deepEqual(direct?.mention_ids, ['555']);
+  assert.equal(direct?.reply_to_message_id, '21');
+  assert.equal(direct?.timestamp, undefined);
+  await adapter.stop();
+});
+
+test('OneBot message_sent is dropped by default and emitted as is_self when include_self is set', async () => {
+  const sentPrivate = { post_type: 'message_sent', message_type: 'private', message_id: 31, self_id: 100, user_id: 100,
+    target_id: 201, sender: { user_id: 100, nickname: 'me' }, message: 'note to bob' };
+  const sentGroup = { post_type: 'message_sent', message_type: 'group', message_id: 32, self_id: 100, user_id: 100,
+    group_id: 300, message: 'hello group' };
+  const off = await oneBotFixture('qq.self.off', 6802);
+  off.api.emit(sentPrivate);
+  off.api.emit(sentGroup);
+  off.api.emit({ post_type: 'message', message_type: 'private', message_id: 33, self_id: 100, user_id: 201, message: 'after' });
+  await until(() => off.events.length === 1, 'only the peer message');
+  assert.equal(off.events[0]?.platform_event_id, '33');
+  await off.adapter.stop();
+
+  const on = await oneBotFixture('qq.self.on', 6803, { include_self: true });
+  on.api.emit(sentPrivate);
+  on.api.emit(sentGroup);
+  on.api.emit({ ...sentPrivate, message_id: 34, target_id: undefined });
+  await until(() => on.events.length === 2, 'two self events');
+  assert.deepEqual(on.events.map((e) => [e.identity.chat_id, e.identity.sender_id, e.identity.chat_kind, e.is_self]),
+    [['201', '100', 'private', true], ['300', '100', 'group', true]]);
+  assert.equal(on.events[0]?.identity.sender_name, 'me');
+  await on.adapter.stop();
+});

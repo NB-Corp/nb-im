@@ -178,7 +178,9 @@ function buildOneBot(spec: OneBotSpec, store: SessionCursorStore, key: string): 
       pending.get(echo)?.resolve(body);
       return;
     }
-    if (body.post_type !== 'message' && body.post_type !== undefined) return;
+    // `message_sent` reports the account's own messages; only hosts that opt in see them.
+    const sent = body.post_type === 'message_sent';
+    if (body.post_type !== 'message' && body.post_type !== undefined && !(sent && spec.include_self)) return;
     if (body.message_type !== 'private' && body.message_type !== 'group') return;
     const selfId = typeof body.self_id === 'number' || typeof body.self_id === 'string' ?
       String(body.self_id) : selfHeader || accountId;
@@ -191,14 +193,30 @@ function buildOneBot(spec: OneBotSpec, store: SessionCursorStore, key: string): 
     try {
       const userId = textOfId(body.user_id);
       const groupId = textOfId(body.group_id);
-      const senderId = userId || textOfId(record(body.sender)?.user_id);
+      const sender = record(body.sender);
+      const senderId = userId || textOfId(sender?.user_id);
       if (!senderId) return;
       if (body.message_type === 'group' && !groupId) return;
+      // A private message the account sent belongs to the peer's chat (`target_id`).
+      const peerId = sent ? textOfId(body.target_id) : senderId;
+      if (body.message_type === 'private' && !peerId) return;
+      const senderName = nonEmpty(sender?.card) ?? nonEmpty(sender?.nickname);
+      const chatTitle = body.message_type === 'group' ? nonEmpty(body.group_name) : undefined;
       const identity: SessionIdentity = body.message_type === 'group' ? {
         ...account, chat_id: groupId, sender_id: senderId, topic_id: '0', chat_kind: 'group',
-      } : { ...account, chat_id: senderId, sender_id: senderId, topic_id: '0', chat_kind: 'private' };
-      const inbound = await inboundOf(body, eventKey, messageId, identity);
-      if (!inbound) { await keep(eventKey); return; }
+        ...(chatTitle ? { chat_title: chatTitle } : {}), ...(senderName ? { sender_name: senderName } : {}),
+      } : { ...account, chat_id: peerId, sender_id: senderId, topic_id: '0', chat_kind: 'private',
+        ...(senderName ? { sender_name: senderName } : {}) };
+      const found = await inboundOf(body, eventKey, messageId, identity);
+      if (!found) { await keep(eventKey); return; }
+      const time = typeof body.time === 'number' && Number.isSafeInteger(body.time) && body.time > 0 ? body.time * 1000 : undefined;
+      const refs = references(body.message);
+      const self = sent || (/^[1-9]\d{0,15}$/u.test(selfId) && senderId === selfId);
+      const inbound: SessionInbound = { ...found, source_message_id: messageId,
+        ...(time !== undefined && Number.isSafeInteger(time) ? { timestamp: time } : {}),
+        mentioned: refs.mentionIds.includes(selfId), mention_ids: refs.mentionIds,
+        ...(refs.replyTo ? { reply_to_message_id: refs.replyTo } : {}),
+        ...(self ? { is_self: true } : {}) };
       // OneBot does not redeliver a frame. Retry admit locally until the host accepts or the loop stops.
       while (run.state !== 'stopped' && run.state !== 'conflict' && run.state !== 'auth_expired') {
         let decision;
@@ -356,6 +374,32 @@ function buildOneBot(spec: OneBotSpec, store: SessionCursorStore, key: string): 
     return receiptOf(response);
   }
   return adapter;
+}
+function nonEmpty(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value.slice(0, 512) : undefined;
+}
+/** `at` and `reply` segments, from either the array form or CQ-code strings. `@all` is not a mention id. */
+function references(message: unknown): { mentionIds: string[]; replyTo?: string } {
+  const at: string[] = [];
+  let replyTo: string | undefined;
+  const add = (type: string, data: Record<string, unknown> | undefined): void => {
+    const qq = data?.qq;
+    if (type === 'at') { const id = textOfId(typeof qq === 'string' ? qq.trim() : qq); if (id && !at.includes(id)) at.push(id); }
+    const id = data?.id;
+    if (type === 'reply' && replyTo === undefined && (typeof id === 'number' || typeof id === 'string') &&
+        /^-?\d{1,20}$/u.test(String(id))) replyTo = String(id);
+  };
+  if (Array.isArray(message)) for (const segment of message) {
+    const body = record(segment);
+    if (typeof body?.type === 'string') add(body.type, record(body.data));
+  } else if (typeof message === 'string') {
+    for (const match of message.matchAll(/\[CQ:(at|reply),([^\]]*)\]/gu)) {
+      const data: Record<string, unknown> = {};
+      for (const pair of match[2]!.split(',')) { const cut = pair.indexOf('='); if (cut > 0) data[pair.slice(0, cut)] = pair.slice(cut + 1); }
+      add(match[1]!, data);
+    }
+  }
+  return { mentionIds: at.slice(0, 100), ...(replyTo === undefined ? {} : { replyTo }) };
 }
 function textOfId(value: unknown): string {
   if (typeof value === 'number' && Number.isSafeInteger(value)) return String(value);

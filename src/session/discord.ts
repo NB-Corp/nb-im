@@ -38,9 +38,19 @@ export function createDiscordConnection(token: string, rest = new REST({ version
       client.on(Events.Error, fail);
       client.on(Events.MessageCreate, (message) => {
         const channel = message.channel;
-        const raw = { ...object(message.toJSON()), id: message.id, content: message.content, channel_id: message.channelId,
-          author: { id: message.author.id, bot: message.author.bot },
-          channel: { type: channel.type, parent_id: channel.isThread() ? channel.parentId : undefined },
+        // Discord API field names; normalize() in realtime.ts reads this shape.
+        const raw = { ...object(message.toJSON()), id: message.id, type: message.type, content: message.content,
+          channel_id: message.channelId, timestamp: message.createdAt.toISOString(),
+          webhook_id: message.webhookId ?? undefined,
+          author: { id: message.author.id, bot: message.author.bot, username: message.author.username,
+            global_name: message.author.globalName ?? undefined },
+          member: message.member ? { nick: message.member.nickname ?? undefined } : undefined,
+          mentions: [...message.mentions.users.keys()],
+          referenced_message: message.mentions.repliedUser ? { author: { id: message.mentions.repliedUser.id } } : undefined,
+          message_reference: message.reference ? { message_id: message.reference.messageId } : undefined,
+          channel: { type: channel.type, parent_id: channel.isThread() ? channel.parentId : undefined,
+            name: 'name' in channel ? channel.name ?? undefined : undefined,
+            parent_name: channel.isThread() ? channel.parent?.name : undefined },
           attachments: [...message.attachments.values()].map((a) => ({ id: a.id, url: a.url,
             filename: a.name, content_type: a.contentType, size: a.size, duration_secs: a.duration ?? undefined })) };
         void handlers.onEvent(raw).catch(fail);

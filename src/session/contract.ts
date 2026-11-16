@@ -12,8 +12,10 @@ export const FEISHU_CARD_UTF8_BYTES = 30 * 1024;
 export const FEISHU_IMAGE_BYTES = 10 * 1024 * 1024;
 export const FEISHU_FILE_BYTES = 30 * 1024 * 1024;
 
+export const WECOM_AIBOT_MARKDOWN_UTF8_BYTES = 20_480;
+
 export type SessionPlatformId = 'telegram' | 'feishu_app' | 'qq_onebot_v11' | 'personal_wechat' |
-  'discord' | 'slack' | 'matrix';
+  'discord' | 'slack' | 'matrix' | 'wecom_aibot' | 'script';
 export type SessionErrorKind = 'auth' | 'forbidden' | 'not_found' | 'conflict' | 'rate_limited' |
   'too_long' | 'bad_format' | 'unsupported' | 'cancelled' | 'configuration' | 'unknown';
 export type SessionRunState = 'idle' | 'starting' | 'running' | 'reconnecting' | 'conflict' |
@@ -208,6 +210,26 @@ export interface WechatTransport {
   getBytes(url: string, signal: AbortSignal): Promise<{ status: number; body: Uint8Array }>;
 }
 
+/** One WeCom AI-bot long connection: JSON frames `{cmd, headers: {req_id}, body}` over a WebSocket. */
+export interface WecomAibotLink {
+  send(frame: unknown): void;
+  onFrame(handler: (frame: unknown) => void): void;
+  onClose(handler: () => void): void;
+  close(): void;
+}
+export interface WecomAibotDownload {
+  ok: boolean;
+  bytes?: Uint8Array;
+  filename?: string;
+  mime?: string;
+  too_large?: boolean;
+}
+export interface WecomAibotTransport {
+  connect(url: string, signal: AbortSignal): Promise<WecomAibotLink>;
+  /** Inbound media URLs (valid five minutes, AES-encrypted). Private addresses are not a valid target. */
+  download(url: string, cap: number, signal: AbortSignal): Promise<WecomAibotDownload>;
+}
+
 /** Raw platform events cross this seam; production connections use the pinned SDKs. */
 export interface RealtimeHandlers {
   onReady(account_id: string): void;
@@ -234,6 +256,18 @@ interface SessionSpecBase {
   instance_id: string;
   retry_ms?: number;
   poll_timeout_ms?: number;
+  /**
+   * Emit the bot/account's own messages (with `is_self: true`) where the adapter otherwise drops them:
+   * Discord/Slack/Matrix own messages, WeChat iLink bot messages, OneBot `message_sent`. Default false.
+   * Telegram, Feishu and script channels already report `is_self` and are unaffected.
+   */
+  include_self?: boolean;
+  /**
+   * Emit `operation: 'edit' | 'retract'` events where the adapter otherwise drops them: Slack
+   * `message_changed`/`message_deleted`, Matrix `m.replace` edits and redactions. Default false.
+   * `source_message_id` names the edited/retracted message; a retract carries an empty text payload.
+   */
+  include_edits?: boolean;
 }
 export type SessionSpec = SessionSpecBase & (
   | { platform: 'telegram'; token: string; transport?: TelegramBotTransport }
@@ -246,6 +280,14 @@ export type SessionSpec = SessionSpecBase & (
   | { platform: 'discord'; bot_token: string; connection?: RealtimeConnection }
   | { platform: 'slack'; bot_token: string; app_token: string; connection?: RealtimeConnection }
   | { platform: 'matrix'; homeserver: string; access_token: string; connection?: RealtimeConnection }
+  /** WeCom AI bot (企业微信智能机器人) in API mode over the long connection: Bot ID + long-connection Secret. */
+  | { platform: 'wecom_aibot'; bot_id: string; secret: string; ws_url?: string; transport?: WecomAibotTransport;
+      heartbeat_ms?: number; ack_timeout_ms?: number }
+  /** Custom channel: a child process speaking nb-im-script/1 JSON lines over stdio (see session/script.ts). */
+  | { platform: 'script'; command: readonly string[]; cwd?: string; env?: Readonly<Record<string, string>>;
+      send_timeout_ms?: number; on_log?: (line: string) => void;
+      /** Longest accepted stdout line in bytes (default SCRIPT_LINE_BYTES, 40 MiB); longer kills and restarts. */
+      max_line_bytes?: number }
 );
 
 const KINDS = new Set<SessionErrorKind>(['auth', 'forbidden', 'not_found', 'conflict', 'rate_limited',

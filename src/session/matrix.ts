@@ -39,6 +39,21 @@ export function createMatrixConnection(homeserver: string, token: string): Realt
     } });
   const encrypted = new Set<string>();
   const direct = new Set<string>();
+  // Display metadata learned from sync state/timeline. Lazy member loading sends members of timeline senders.
+  const roomNames = new Map<string, string>();
+  const members = new Map<string, Map<string, string>>();
+  const learn = (roomId: string, event: Record<string, unknown>): void => {
+    const content = object(event.content);
+    if (event.type === 'm.room.name' && event.state_key === '') {
+      if (str(content.name).trim()) roomNames.set(roomId, str(content.name)); else roomNames.delete(roomId);
+    } else if (event.type === 'm.room.member' && str(event.state_key)) {
+      const names = members.get(roomId) ?? new Map<string, string>();
+      names.delete(str(event.state_key));
+      if (content.membership === 'join' && str(content.displayname).trim()) names.set(str(event.state_key), str(content.displayname));
+      while (names.size > 2000) names.delete(names.keys().next().value!);
+      members.set(roomId, names);
+    }
+  };
   // SDK timeoutSignal leaves referenced timers after requests; native timeout signals do not hold the host open.
   const opts = (signal: AbortSignal) => ({ abortSignal: AbortSignal.any([signal, AbortSignal.timeout(40000)]) });
   return {
@@ -80,8 +95,15 @@ export function createMatrixConnection(homeserver: string, token: string): Realt
               const event = object(raw);
               if (event.type === 'm.room.encryption') encrypted.add(roomId);
             }
-            if (!baseline && !encrypted.has(roomId)) for (const raw of events) {
-              await handlers.onEvent({ ...object(raw), room_id: roomId, is_direct: direct.has(roomId) });
+            for (const raw of stateEvents) learn(roomId, object(raw));
+            if (baseline) for (const raw of events) learn(roomId, object(raw));
+            else if (!encrypted.has(roomId)) for (const raw of events) {
+              const event = object(raw);
+              learn(roomId, event);
+              const senderName = members.get(roomId)?.get(str(event.sender));
+              const roomName = roomNames.get(roomId);
+              await handlers.onEvent({ ...event, room_id: roomId, is_direct: direct.has(roomId),
+                ...(senderName ? { sender_name: senderName } : {}), ...(roomName ? { room_name: roomName } : {}) });
             }
           }
           const next = str(page.next_batch);
