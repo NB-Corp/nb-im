@@ -96,10 +96,11 @@ async function fetchPublic(raw: string, cap: number, signal: AbortSignal, redire
   }
   if (!ips.length || ips.some((ip) => !publicAddress(ip))) return { ok: false };
   const ip = ips.find((x) => isIP(x) === 4) ?? ips[0]!;
+  const family = isIP(ip) === 6 ? 6 : 4;
   return new Promise((resolve) => {
-    const req = https.request({ hostname: host, servername: isIP(host) ? undefined : host, port: url.port || 443,
+    const req = https.request({ hostname: host, servername: isIP(host) ? undefined : host, family, port: url.port || 443,
       path: url.pathname + url.search, method: 'GET', agent: false, signal, timeout: 20_000,
-      lookup: (_h, _o, callback) => callback(null, ip, isIP(ip) as 4 | 6) }, (res) => {
+      lookup: (_h, _o, callback) => callback(null, ip, family) }, (res) => {
       const status = res.statusCode ?? 0;
       if (status >= 300 && status < 400 && res.headers.location && redirects < 3) {
         res.resume();

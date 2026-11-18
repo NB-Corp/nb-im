@@ -19,11 +19,12 @@ export async function downloadPlatformMedia(raw: string, input: {
   const ips = answers.flatMap((a) => a.status === 'fulfilled' ? a.value : []);
   if (!ips.length || ips.some((ip) => !publicAddress(ip))) throw new Error('media_address_rejected');
   const ip = ips.find((ip) => isIP(ip) === 4) ?? ips[0]!;
+  const family = isIP(ip) === 6 ? 6 : 4;
   const auth = input.platform === 'slack' && input.token && (host === 'files.slack.com' || host === 'slack.com');
   return new Promise((resolve, reject) => {
-    const req = https.request({ hostname: host, path: url.pathname + url.search, method: 'GET', agent: false,
+    const req = https.request({ hostname: host, family, path: url.pathname + url.search, method: 'GET', agent: false,
       signal: input.signal, timeout: 15000, headers: auth ? { authorization: `Bearer ${input.token}` } : {},
-      lookup: (_host, _opts, callback) => callback(null, ip, isIP(ip) as 4 | 6),
+      lookup: (_host, _opts, callback) => callback(null, ip, family),
     }, (res) => {
       const status = res.statusCode ?? 0;
       if (status >= 300 && status < 400 && res.headers.location && redirects < 3) {

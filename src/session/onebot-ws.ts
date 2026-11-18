@@ -103,7 +103,7 @@ async function publicMedia(url: URL, signal: AbortSignal): Promise<{ ok: true; b
   const family = isIP(ip) === 6 ? 6 : 4;
   const request = url.protocol === 'https:' ? https.request : http.request;
   return new Promise((resolve) => {
-    const req = request({ hostname: literal, servername: literal, path: `${url.pathname}${url.search}`,
+    const req = request({ hostname: literal, servername: literal, family, path: `${url.pathname}${url.search}`,
       method: 'GET', timeout: 15_000, agent: false,
       lookup: (_hostname, _options, callback) => callback(null, ip, family),
     }, (res) => {
